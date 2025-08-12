@@ -4,7 +4,7 @@ import re
 from urllib.parse import urljoin
 
 def extract_items(html_content, base_url):
-    junk_keywords = ["skip", "main menu", "footer", "cookie"]
+    junk_keywords = ["skip", "main menu", "footer", "cookie"] # Don't include html with these words
     soup = BeautifulSoup(html_content, 'html.parser')
     items = []
 

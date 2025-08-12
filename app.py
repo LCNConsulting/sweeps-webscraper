@@ -10,14 +10,13 @@ from utils.scraper import extract_items, clean_html
 from utils.storage import load_previous_snapshot, save_snapshot, detect_new_items, push_bulk_snapshots
 from utils.fetcher import fetch_html
 
-# --- Load environment variables ---
 load_dotenv()
 PASSWORD = os.getenv("APP_PASSWORD") or st.secrets["APP_PASSWORD"]
-CHUNK_SIZE = 2 # Num of rows processed before pushing to GitHub
+CHUNK_SIZE = 2 # Num of rows processed at a time
 
-# --- Page Config & Styling ---
+# Page Config & Styling
 st.set_page_config(
-    page_title="LCN Consulting - Change Detection Platform",
+    page_title="Sweeps Change Detection Platform",
     page_icon="🔍",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -97,7 +96,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- Header ---
+# Header
 def create_header():
     st.markdown("""
     <div class="lcn-header">
@@ -106,7 +105,7 @@ def create_header():
     </div>
     """, unsafe_allow_html=True)
 
-# --- Sidebar ---
+# Sidebar
 def create_sidebar():
     with st.sidebar:
         st.markdown("### 📋 Platform Overview")
@@ -115,11 +114,11 @@ def create_sidebar():
         st.markdown("### 📊 Required Data Format")
         st.write("**CSV columns needed:** `Company`, `URL`, `URL Type`")
 
-# --- Session State for Login ---
+# Session State for Login
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
-# --- Login Page ---
+# Login Page
 if not st.session_state.authenticated:
     st.title("Login")
     password_input = st.text_input("Enter Password", type="password")
@@ -132,7 +131,7 @@ if not st.session_state.authenticated:
             st.error("Incorrect password")
     st.stop()
 
-# --- Main Upload Page ---
+# Main Upload Page
 create_header()
 create_sidebar()
 st.markdown("## 📂 Upload Configuration File")
@@ -144,6 +143,7 @@ for key in ["changes", "no_changes", "errors"]:
     if key not in st.session_state:
         st.session_state[key] = []
 
+# Summary
 if st.session_state.changes or st.session_state.no_changes or st.session_state.errors:
     st.markdown("## Summary")
     st.markdown("### Changes")
@@ -167,6 +167,7 @@ if st.session_state.changes or st.session_state.no_changes or st.session_state.e
     else:
         st.markdown("No errors.")
 
+# File Inputter
 uploaded_file = st.file_uploader(
     "Upload Competitor Configuration File",
     type=['csv'],
@@ -174,6 +175,7 @@ uploaded_file = st.file_uploader(
     key=f"uploaded_file_{st.session_state.uploader_key}"
 )
 
+# Generate rows from the CSV file
 def csv_row_generator(file):
     try:
         text = io.TextIOWrapper(file, encoding="utf-8-sig")
@@ -195,8 +197,11 @@ def csv_row_generator(file):
             "company": row["company"], 
             "url type": row["url type"]
         }
+
+# Read an uploaded file
 if uploaded_file:
     st.write(f"Processing file: {uploaded_file.name}")
+    project_name = os.path.splitext(uploaded_file.name)[0]
 
     changes, no_changes, errors = [], [], []
     start = time.time()
@@ -208,13 +213,14 @@ if uploaded_file:
     buffer = []
     total_processed = 0
 
-    # --- Process in chunks ---
+    # Process in chunks
     for row in rows:
         buffer.append(row)
         
+        # Reach threshold chunk size
         if len(buffer) >= CHUNK_SIZE:
             for entry in buffer:
-                u, c, t = entry["url"], entry ["company"], entry["url type"]
+                u, c, t = entry["url"], entry ["company"], entry["url type"] # Read item in each column
                 status_box = results_container.empty()
 
                 try:
@@ -225,11 +231,14 @@ if uploaded_file:
                         del html # Free memory early
 
                         items, error = extract_items(cleaned_html, u)
+
+                        # Actually scrape all the important information
                         if error:
                             errors.append(f'<div class="status-error">🚨"⚠️ Could not extract structured content from {c} ({t}): {error}\n"</div>')
                             continue
 
-                        previous = load_previous_snapshot(c, t)
+                        # Compare to previous saves: Has there been a change?
+                        previous = load_previous_snapshot(project_name, c, t)
                         new_items = detect_new_items(previous, items)
                         del previous # Free memory
 
@@ -241,7 +250,7 @@ if uploaded_file:
                         else:
                             no_changes.append(f'<div class="status-success">✅ {c} ({t}) - No Change</div>')
 
-                        save_snapshot(c, t, items)
+                        save_snapshot(project_name, c, t, items) # Save current version of the site
                         del items
                         gc.collect()
                     else:
@@ -259,7 +268,7 @@ if uploaded_file:
                 gc.collect()
             buffer.clear()
 
-     # Process leftover rows
+     # Process leftover rows that weren't chunked
     if buffer:
         for entry in buffer:
             u, c, t = entry["url"], entry["company"], entry["url type"]
@@ -303,7 +312,7 @@ if uploaded_file:
             progress_bar.progress(min(1.0, total_processed / (total_processed + 3)))
             gc.collect()
 
-    push_bulk_snapshots()
+    push_bulk_snapshots(project_name) # Push changes to GitHub
 
     progress_bar.empty()
 
@@ -311,13 +320,13 @@ if uploaded_file:
     st.session_state.no_changes = no_changes
     st.session_state.errors = errors
 
-    # --- Reset uploader but keep results ---
+    # Reset uploader but keep results
     uploaded_file = None
     st.session_state.uploader_key += 1
     st.rerun()
     
 
-# --- Logout Button ---
+# Logout Button
 if st.session_state.authenticated:
     if st.button("Logout"):
         st.session_state.authenticated = False
