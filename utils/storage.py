@@ -6,6 +6,8 @@ import base64
 import requests
 import zipfile
 from io import BytesIO
+from dotenv import load_dotenv
+load_dotenv()
 
 # Paths & Config
 SNAPSHOT_DIR = os.path.join('data', 'snapshots')
@@ -13,15 +15,21 @@ ZIP_FILENAME = "snapshots.zip"
 ZIP_PATH_LOCAL = os.path.join(SNAPSHOT_DIR, ZIP_FILENAME)
 
 UPDATED_FILES = set()
-GITHUB_OWNER = os.getenv("GITHUB_OWNER")
-GITHUB_REPO = os.getenv("GITHUB_REPO")
-GITHUB_BRANCH = os.getenv("GITHUB_BRANCH")
 
 try:
     from streamlit.runtime.secrets import secrets
+    GITHUB_OWNER = secrets["GITHUB_OWNER"]
+    GITHUB_REPO = secrets["GITHUB_REPO"]
+    GITHUB_BRANCH = secrets["GITHUB_BRANCH"]
     GITHUB_TOKEN = secrets["GITHUB_TOKEN"]
 except:
+    GITHUB_OWNER = os.getenv("GITHUB_OWNER")
+    GITHUB_REPO = os.getenv("GITHUB_REPO")
+    GITHUB_BRANCH = os.getenv("GITHUB_BRANCH")
     GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+
+if not GITHUB_TOKEN:
+    raise RuntimeError("❌ No GitHub token found! Set GITHUB_TOKEN in Streamlit secrets or environment variables.")
 
 # --- Helpers ---
 def get_zip_path(project_name):
@@ -129,6 +137,7 @@ def push_bulk_snapshots(project_name):
     sha = response.json().get("sha") if response.status_code == 200 else None
 
     # Push if contents differ
+    print("Token loaded?", bool(GITHUB_TOKEN), "Length:", len(GITHUB_TOKEN) if GITHUB_TOKEN else None)
     push = True
     if sha:
         remote_content = requests.get(f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{github_zip_path}")
@@ -144,8 +153,12 @@ def push_bulk_snapshots(project_name):
         }
         if sha:
             commit_data["sha"] = sha
+        
+        print("Local zip exists?", os.path.exists(get_zip_path(project_name)))
+        print("Updated files:", UPDATED_FILES)
 
         put_response = requests.put(api_url, headers=headers, json=commit_data)
+        print("GitHub API status:", put_response.status_code, put_response.text)
         if put_response.status_code not in [200, 201]:
             print(f"❌ Failed to push ZIP for {project_name}: {put_response.text}")
         else:
