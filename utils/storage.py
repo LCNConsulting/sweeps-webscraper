@@ -15,6 +15,7 @@ SNAPSHOT_DIR = os.path.join('data', 'snapshots')
 ZIP_FILENAME = "snapshots.zip"
 ZIP_PATH_LOCAL = os.path.join(SNAPSHOT_DIR, ZIP_FILENAME)
 
+UPDATED_FILES = set()
 if "UPDATED_FILES" not in st.session_state:
     st.session_state.UPDATED_FILES = set()
 
@@ -106,7 +107,7 @@ def save_snapshot(project_name, company_name, url_type, data):
     with open(zip_path, "wb") as f:
         f.write(buffer.getvalue())
 
-    UPDATED_FILES.add((project_name, key))
+    st.session_state.UPDATED_FILES.add((project_name, key))
 
 # --- Hashing & Change Detection ---
 def hash_item(item):
@@ -119,7 +120,7 @@ def detect_new_items(previous, current):
 
 # --- Push ZIP if changed ---
 def push_bulk_snapshots(project_name):
-    project_updates = [key for proj, key in UPDATED_FILES if proj == project_name]
+    project_updates = [key for proj, key in st.session_state.UPDATED_FILES if proj == project_name]
     if not project_updates:
         print("No changes detected — skipping push.")
         return
