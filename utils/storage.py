@@ -5,6 +5,7 @@ import hashlib
 import base64
 import requests
 import zipfile
+import streamlit as st
 from io import BytesIO
 from dotenv import load_dotenv
 load_dotenv()
@@ -14,7 +15,8 @@ SNAPSHOT_DIR = os.path.join('data', 'snapshots')
 ZIP_FILENAME = "snapshots.zip"
 ZIP_PATH_LOCAL = os.path.join(SNAPSHOT_DIR, ZIP_FILENAME)
 
-UPDATED_FILES = set()
+if "UPDATED_FILES" not in st.session_state:
+    st.session_state.UPDATED_FILES = set()
 
 try:
     from streamlit.runtime.secrets import secrets
