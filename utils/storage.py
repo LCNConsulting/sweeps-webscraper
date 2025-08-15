@@ -16,15 +16,12 @@ ZIP_FILENAME = "snapshots.zip"
 ZIP_PATH_LOCAL = os.path.join(SNAPSHOT_DIR, ZIP_FILENAME)
 
 UPDATED_FILES = set()
-if "UPDATED_FILES" not in st.session_state:
-    st.session_state.UPDATED_FILES = set()
 
 try:
-    from streamlit.runtime.secrets import secrets
-    GITHUB_OWNER = secrets["GITHUB_OWNER"]
-    GITHUB_REPO = secrets["GITHUB_REPO"]
-    GITHUB_BRANCH = secrets["GITHUB_BRANCH"]
-    GITHUB_TOKEN = secrets["GITHUB_TOKEN"]
+    GITHUB_OWNER = st.secrets["GITHUB_OWNER"]
+    GITHUB_REPO = st.secrets["GITHUB_REPO"]
+    GITHUB_BRANCH = st.secrets["GITHUB_BRANCH"]
+    GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
 except:
     GITHUB_OWNER = os.getenv("GITHUB_OWNER")
     GITHUB_REPO = os.getenv("GITHUB_REPO")
@@ -107,7 +104,7 @@ def save_snapshot(project_name, company_name, url_type, data):
     with open(zip_path, "wb") as f:
         f.write(buffer.getvalue())
 
-    st.session_state.UPDATED_FILES.add((project_name, key))
+    UPDATED_FILES.add((project_name, key))
 
 # --- Hashing & Change Detection ---
 def hash_item(item):
@@ -120,7 +117,7 @@ def detect_new_items(previous, current):
 
 # --- Push ZIP if changed ---
 def push_bulk_snapshots(project_name):
-    project_updates = [key for proj, key in st.session_state.UPDATED_FILES if proj == project_name]
+    project_updates = [key for proj, key in UPDATED_FILES if proj == project_name]
     if not project_updates:
         print("No changes detected — skipping push.")
         return
