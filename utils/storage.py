@@ -1,165 +1,259 @@
 # To store information about a site
 import os
+import re
 import json
-import hashlib
 import base64
-import requests
+import hashlib
 import zipfile
-import streamlit as st
+import threading
 from io import BytesIO
+from datetime import datetime, timezone
+from urllib.parse import quote, urlsplit, urlunsplit
+
+import requests
+import streamlit as st
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # Paths & Config
-SNAPSHOT_DIR = os.path.join('data', 'snapshots')
-ZIP_FILENAME = "snapshots.zip"
-ZIP_PATH_LOCAL = os.path.join(SNAPSHOT_DIR, ZIP_FILENAME)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SNAPSHOT_DIR = os.path.join(REPO_ROOT, "data", "snapshots")
+GITHUB_SNAPSHOT_DIR = "data/snapshots"
+SNAPSHOT_VERSION = 2
+GITHUB_TIMEOUT = 30  # seconds per GitHub API request
 
-UPDATED_FILES = set()
+# One lock per project, so two sessions saving the same project don't interleave
+_LOCKS = {}
 
-try:
-    GITHUB_OWNER = st.secrets["GITHUB_OWNER"]
-    GITHUB_REPO = st.secrets["GITHUB_REPO"]
-    GITHUB_BRANCH = st.secrets["GITHUB_BRANCH"]
-    GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
-except:
-    GITHUB_OWNER = os.getenv("GITHUB_OWNER")
-    GITHUB_REPO = os.getenv("GITHUB_REPO")
-    GITHUB_BRANCH = os.getenv("GITHUB_BRANCH")
-    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-if not GITHUB_TOKEN:
-    raise RuntimeError("❌ No GitHub token found! Set GITHUB_TOKEN in Streamlit secrets or environment variables.")
+def _setting(name):
+    """Read a setting from Streamlit secrets, falling back to environment variables."""
+    try:
+        value = st.secrets[name]
+    except Exception:
+        value = None
+    return value or os.getenv(name)
 
-# --- Helpers ---
-def get_zip_path(project_name):
-    """Get local path for project's snapshot ZIP."""
-    return os.path.join(SNAPSHOT_DIR, f"snapshots_{project_name}.zip")
 
-def get_snapshot_key(company_name, url_type):
-    """Generates a consistent JSON filename inside the ZIP."""
+GITHUB_OWNER = _setting("GITHUB_OWNER")
+GITHUB_REPO = _setting("GITHUB_REPO")
+GITHUB_BRANCH = _setting("GITHUB_BRANCH") or "main"
+GITHUB_TOKEN = _setting("GITHUB_TOKEN")
+
+
+def github_configured():
+    return bool(GITHUB_OWNER and GITHUB_REPO and GITHUB_TOKEN)
+
+
+# --- Naming helpers ---
+def clean_project_name(filename):
+    """Project name from an uploaded filename: drop the extension and browser duplicate
+    suffixes like ' (1)' so re-downloaded copies share the same snapshot history."""
+    stem = os.path.splitext(os.path.basename(filename))[0].strip()
+    stem = re.sub(r"\s*\(\d+\)$", "", stem)
+    stem = re.sub(r'[\\/:*?"<>|#%]', "-", stem)
+    return stem or "project"
+
+
+def normalize_url(url):
+    """Canonical form of a URL for identity: trimmed, lower-case scheme/host, no fragment."""
+    parts = urlsplit(url.strip())
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, parts.query, ""))
+
+
+def snapshot_key(url):
+    """ZIP entry name for a URL. Keyed by URL so two rows that share Company + URL Type
+    (e.g. three 'Ionis / PR' pages) no longer overwrite each other's snapshot."""
+    return "url_" + hashlib.sha1(normalize_url(url).encode("utf-8")).hexdigest()[:16] + ".json"
+
+
+def legacy_snapshot_key(company_name, url_type):
+    """ZIP entry name used by the previous version of the tool (Company_URL_Type.json)."""
     return f"{company_name}_{url_type}".replace(" ", "_") + ".json"
 
-def _load_zip_from_github(project_name):
-    """Fetches snapshots.zip from GitHub."""
-    try:
-        zip_filename = f"snapshots_{project_name}.zip"
-        zip_url = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}/data/snapshots/{zip_filename}"
-        r = requests.get(zip_url)
-        if r.status_code == 200:
-            return zipfile.ZipFile(BytesIO(r.content))
-    except Exception as e:
-        print(f"⚠️ Could not load ZIP from GitHub: {e}")
-    return None
 
-def _load_local_zip(project_name):
-    """Loads local snapshots.zip if it exists."""
-    path = get_zip_path(project_name)
-    if os.path.exists(path):
-        return zipfile.ZipFile(path, "r")
-    return None
+# --- GitHub helpers ---
+def _api_url(repo_path):
+    return f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{quote(repo_path)}"
 
-# --- Snapshot Loading ---
-def load_previous_snapshot(project_name, company_name, url_type):
-    key = get_snapshot_key(company_name, url_type)
 
-    # 1. Try local zip
-    local_zip = _load_local_zip(project_name)
-    if local_zip and key in local_zip.namelist():
-        with local_zip.open(key) as f:
-            return json.load(f)
+def _headers(accept="application/vnd.github+json"):
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": accept,
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
-    # 2. Try GitHub zip
-    gh_zip = _load_zip_from_github(project_name)
-    if gh_zip and key in gh_zip.namelist():
-        with gh_zip.open(key) as f:
-            return json.load(f)
 
-    return []
+def _github_get_zip(repo_path):
+    """Returns (zip bytes, sha) from GitHub, or (None, None) if the file does not exist yet.
+    Uses the authenticated contents API, which works for private repos and is not CDN-cached."""
+    meta = requests.get(_api_url(repo_path), headers=_headers("application/vnd.github.object"),
+                        params={"ref": GITHUB_BRANCH}, timeout=GITHUB_TIMEOUT)
+    if meta.status_code == 404:
+        return None, None
+    meta.raise_for_status()
+    sha = meta.json().get("sha")
+    raw = requests.get(_api_url(repo_path), headers=_headers("application/vnd.github.raw+json"),
+                       params={"ref": GITHUB_BRANCH}, timeout=GITHUB_TIMEOUT)
+    raw.raise_for_status()
+    return raw.content, sha
 
-# --- Snapshot Saving ---
-def save_snapshot(project_name, company_name, url_type, data):
-    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-    zip_path = get_zip_path(project_name)
 
-    # Ensure local zip exists (create if missing)
-    if not os.path.exists(zip_path):
-        with zipfile.ZipFile(zip_path, "w") as _:
-            pass
+def _read_zip(data):
+    """Returns {entry name: (bytes, date_time tuple)} for a ZIP given as bytes."""
+    entries = {}
+    with zipfile.ZipFile(BytesIO(data)) as zf:
+        for info in zf.infolist():
+            entries[info.filename] = (zf.read(info), info.date_time)
+    return entries
 
-    # Create a temp buffer to rewrite ZIP with updated JSON
-    buffer = BytesIO()
-    key = get_snapshot_key(company_name, url_type)
 
-    with zipfile.ZipFile(zip_path, "r") as old_zip, \
-         zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as new_zip:
-        # Copy over everything except the updated file
-        for item in old_zip.namelist():
-            if item != key:
-                new_zip.writestr(item, old_zip.read(item))
-        # Write the updated JSON
-        new_zip.writestr(key, json.dumps(data, indent=2))
+def _merge(primary, secondary):
+    """Merge two entry dicts, keeping whichever copy of each entry was written most recently."""
+    merged = dict(secondary)
+    for key, value in primary.items():
+        if key not in merged or value[1] >= merged[key][1]:
+            merged[key] = value
+    return merged
 
-    # Save updated ZIP locally
-    with open(zip_path, "wb") as f:
-        f.write(buffer.getvalue())
 
-    UPDATED_FILES.add((project_name, key))
+class SnapshotStore:
+    """All snapshots for one project, held in memory for the duration of a sweep.
 
-# --- Hashing & Change Detection ---
-def hash_item(item):
-    data = f"{item.get('title','')}|{item.get('timestamp','')}|{item.get('link','')}"
-    return hashlib.md5(data.encode('utf-8')).hexdigest()
+    The ZIP is read once at the start (GitHub and the local copy are merged, newest entry
+    wins) and written/pushed once at the end, instead of once per row."""
 
-def detect_new_items(previous, current):
-    prev_hashes = set(hash_item(item) for item in previous)
-    return [item for item in current if hash_item(item) not in prev_hashes]
+    def __init__(self, project_name):
+        self.project_name = project_name
+        self.zip_name = f"snapshots_{project_name}.zip"
+        self.local_path = os.path.join(SNAPSHOT_DIR, self.zip_name)
+        self.repo_path = f"{GITHUB_SNAPSHOT_DIR}/{self.zip_name}"
+        self.entries = {}
+        self.updated = {}
+        self.deleted = set()
+        self.warnings = []
 
-# --- Push ZIP if changed ---
-def push_bulk_snapshots(project_name):
-    project_updates = [key for proj, key in UPDATED_FILES if proj == project_name]
-    if not project_updates:
-        print("No changes detected — skipping push.")
-        return
+    # --- Loading ---
+    def load(self):
+        remote, local = {}, {}
+        if github_configured():
+            try:
+                data, _ = _github_get_zip(self.repo_path)
+                if data:
+                    remote = _read_zip(data)
+            except Exception as e:
+                self.warnings.append(f"Could not load snapshot history from GitHub ({e}); using the local copy.")
+        if os.path.exists(self.local_path):
+            try:
+                with open(self.local_path, "rb") as f:
+                    local = _read_zip(f.read())
+            except Exception as e:
+                self.warnings.append(f"Local snapshot file is unreadable ({e}); ignoring it.")
+        self.entries = _merge(remote, local)
+        return self
 
-    # Encode new ZIP
-    zip_path = get_zip_path(project_name)
-    with open(zip_path, "rb") as f:
-        new_zip_data = f.read()
-    encoded_content = base64.b64encode(new_zip_data).decode("utf-8")
+    @property
+    def has_history(self):
+        return bool(self.entries)
 
-    # Check remote SHA
-    zip_filename = f"snapshots_{project_name}.zip"
-    github_zip_path = f"data/snapshots/{zip_filename}"
-    api_url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{github_zip_path}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}"}
-    response = requests.get(api_url, headers=headers)
-    sha = response.json().get("sha") if response.status_code == 200 else None
+    def get(self, key):
+        """Returns the parsed snapshot stored under key, or None."""
+        entry = self.entries.get(key)
+        if entry is None:
+            return None
+        try:
+            return json.loads(entry[0].decode("utf-8"))
+        except Exception:
+            return None
 
-    # Push if contents differ
-    print("Token loaded?", bool(GITHUB_TOKEN), "Length:", len(GITHUB_TOKEN) if GITHUB_TOKEN else None)
-    push = True
-    if sha:
-        remote_content = requests.get(f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{github_zip_path}")
-        if remote_content.status_code == 200 and remote_content.content == new_zip_data:
-            print("✅ Remote ZIP matches local — no push needed.")
-            push = False
+    # --- Saving ---
+    def put(self, key, snapshot):
+        stamp = datetime.now(timezone.utc).timetuple()[:6]
+        value = (json.dumps(snapshot, indent=1, ensure_ascii=False).encode("utf-8"), stamp)
+        self.entries[key] = value
+        self.updated[key] = value
+        self.deleted.discard(key)
 
-    if push:
-        commit_data = {
-            "message": f"Bulk snapshot update ({project_name})",
-            "content": encoded_content,
-            "branch": GITHUB_BRANCH
-        }
-        if sha:
-            commit_data["sha"] = sha
-        
-        print("Local zip exists?", os.path.exists(get_zip_path(project_name)))
-        print("Updated files:", UPDATED_FILES)
+    def delete(self, key):
+        """Removes an entry (used to drop old-format snapshots once they have been migrated)."""
+        self.entries.pop(key, None)
+        self.updated.pop(key, None)
+        self.deleted.add(key)
 
-        put_response = requests.put(api_url, headers=headers, json=commit_data)
-        print("GitHub API status:", put_response.status_code, put_response.text)
-        if put_response.status_code not in [200, 201]:
-            print(f"❌ Failed to push ZIP for {project_name}: {put_response.text}")
-        else:
-            print("✅ Bulk snapshots pushed to GitHub.")
+    def _zip_bytes(self):
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for key in sorted(self.entries):
+                data, stamp = self.entries[key]
+                zf.writestr(zipfile.ZipInfo(key, date_time=stamp), data, zipfile.ZIP_DEFLATED)
+        return buffer.getvalue()
+
+    def _write_local(self, content):
+        """Atomic write (temp file + rename), so a crash never leaves a half-written ZIP."""
+        try:
+            os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+            tmp_path = self.local_path + ".tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(content)
+            os.replace(tmp_path, self.local_path)
+            return True
+        except OSError as e:
+            self.warnings.append(f"Could not write the local snapshot copy ({e}).")
+            return False
+
+    def save(self):
+        """Writes the ZIP locally and pushes it to GitHub. Returns (ok, message); never raises."""
+        if not self.updated and not self.deleted:
+            return True, "Nothing changed, so no snapshots needed saving."
+        with _LOCKS.setdefault(self.project_name, threading.Lock()):
+            return self._save()
+
+    def _absorb(self, other):
+        """Merge in entries saved by another run since we loaded (newest wins); the entries
+        this run updated or deleted always win."""
+        self.entries = _merge(other, self.entries)
+        self.entries.update(self.updated)
+        for key in self.deleted:
+            self.entries.pop(key, None)
+
+    def _save(self):
+        if os.path.exists(self.local_path):
+            try:
+                with open(self.local_path, "rb") as f:
+                    self._absorb(_read_zip(f.read()))
+            except Exception:
+                pass  # unreadable local copy: it gets overwritten below
+        local_ok = self._write_local(self._zip_bytes())
+        if not github_configured():
+            if local_ok:
+                return False, "Snapshots saved on this server only — GitHub is not configured."
+            return False, "Snapshots could not be saved (GitHub is not configured and the local copy failed)."
+
+        last_error = ""
+        for _ in range(3):
+            try:
+                remote_data, sha = _github_get_zip(self.repo_path)
+                if remote_data:
+                    self._absorb(_read_zip(remote_data))
+                content = self._zip_bytes()
+                if remote_data == content:
+                    return True, "Snapshot history is already up to date on GitHub."
+                body = {
+                    "message": f"Bulk snapshot update ({self.project_name})",
+                    "content": base64.b64encode(content).decode("ascii"),
+                    "branch": GITHUB_BRANCH,
+                }
+                if sha:
+                    body["sha"] = sha
+                resp = requests.put(_api_url(self.repo_path), headers=_headers(), json=body, timeout=GITHUB_TIMEOUT)
+                if resp.status_code in (200, 201):
+                    self._write_local(content)
+                    return True, f"Saved {len(self.updated)} snapshot(s) to GitHub."
+                last_error = f"GitHub API returned {resp.status_code}: {resp.text[:200]}"
+                if resp.status_code not in (409, 422):  # only a stale sha is worth retrying
+                    break
+            except Exception as e:
+                last_error = str(e)
+        return False, f"Could not push snapshots to GitHub ({last_error}). They are saved on this server for now."
