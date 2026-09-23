@@ -2,18 +2,20 @@
 import csv
 import io
 import os
+import hashlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 from utils.fetcher import fetch_html, validate_url
-from utils.scraper import extract_items, new_items_since, legacy_new_items, public
+from utils.scraper import extract_items, legacy_new_items, public
 from utils.storage import snapshot_key, legacy_snapshot_key, normalize_url, SNAPSHOT_VERSION
 
 MAX_WORKERS = 8          # pages fetched in parallel
 MAX_SEEN = 3000          # item ids remembered per page
+FIRST_SWEEP_DAYS = 7     # someone's first sweep of a project reports items first seen in this window
 REQUIRED_COLUMNS = ("company", "url", "url type")
 
 CHANGED, NO_CHANGE, BASELINE = "Changed", "No Change", "New (baseline saved)"
@@ -83,21 +85,57 @@ def read_csv(data):
     return rows, warnings
 
 
+# --- Who swept when ---
+# Snapshot history is shared by everyone, but each person sees what is new since THEIR last
+# sweep of the project: every item remembers when it was first seen, and each person's last
+# sweep time is stored in the project's ZIP.
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _user_key(name):
+    return "_user_" + hashlib.sha1(name.strip().lower().encode("utf-8")).hexdigest()[:12] + ".json"
+
+
+def last_sweep(store, name):
+    """When this person last completed a sweep of the project (ISO time), or None."""
+    entry = store.get(_user_key(name))
+    return entry.get("last_sweep") if isinstance(entry, dict) else None
+
+
+def record_sweep(store, name, when):
+    store.put(_user_key(name), {"user": name.strip(), "last_sweep": when})
+
+
+def first_sweep_since():
+    """Cut-off used for someone's first sweep of a project (no previous sweep on record)."""
+    return (datetime.now(timezone.utc) - timedelta(days=FIRST_SWEEP_DAYS)).isoformat(timespec="seconds")
+
+
 # --- Sweep ---
-def _snapshot(row, items, previous=None):
-    """Snapshot of a page: its current items, plus every item id seen on earlier checks (so an
-    item that briefly drops off the page and comes back is not reported as new again)."""
-    seen = [item["id"] for item in items]
-    if isinstance(previous, dict):
-        seen += previous.get("seen") or [item.get("id") for item in previous.get("items", [])]
+def _first_seen(previous):
+    """{item id: when it was first seen} from a snapshot; '' means before per-person tracking."""
+    first_seen = dict.fromkeys(previous.get("seen") or [], "")
+    for item in previous.get("items", []):
+        first_seen.setdefault(item.get("id"), "")
+    first_seen.update(previous.get("first_seen") or {})
+    return first_seen
+
+
+def _snapshot(row, items, first_seen, now):
+    """Snapshot of a page: its current items, plus when every item seen so far first appeared
+    (so an item that briefly drops off the page and comes back is not reported as new again)."""
+    stamps = {item["id"]: first_seen.get(item["id"], now) for item in items}
+    for item_id, when in first_seen.items():
+        stamps.setdefault(item_id, when)
     return {
         "version": SNAPSHOT_VERSION,
         "url": row.url,
         "company": row.company,
         "url_type": row.url_type,
-        "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "checked_at": now,
         "items": [public(item) for item in items],
-        "seen": list(dict.fromkeys(seen))[:MAX_SEEN],
+        "first_seen": dict(list(stamps.items())[:MAX_SEEN]),
     }
 
 
@@ -122,13 +160,16 @@ def redirect_warning(requested, final):
     return f"This URL now redirects to {final} — the page may have moved. Consider updating the CSV."
 
 
-def run_sweep(rows, store, on_progress=None, max_workers=MAX_WORKERS):
+def run_sweep(rows, store, on_progress=None, since=None, now=None, max_workers=MAX_WORKERS):
     """Checks every row and returns a list of RowResult (in CSV order).
 
+    An item counts as new if this sweep is the first to see it, or if an earlier sweep (by
+    anyone) first saw it after `since` — the ISO time of this person's previous sweep.
     Pages are fetched in parallel threads; parsing and comparison happen here, one page at
     a time, to keep memory low. Snapshots are updated in `store` but NOT saved — the caller
     saves once the results have been shown to the user. `on_progress(done, total, row)` is
     called from this (the calling) thread, so it may update Streamlit elements."""
+    now = now or now_iso()
     results = {}
     by_url = {}
     for row in rows:
@@ -150,7 +191,7 @@ def run_sweep(rows, store, on_progress=None, max_workers=MAX_WORKERS):
         for future in as_completed(futures):
             group = by_url[futures[future]]
             try:
-                outcome = _process(future.result(), group, store, legacy_counts)
+                outcome = _process(future.result(), group, store, legacy_counts, since, now)
             except Exception as e:  # never let one bad page stop the sweep
                 outcome = {r.line: RowResult(r, ERROR, f"Unexpected error: {e}") for r in group}
             results.update(outcome)
@@ -170,7 +211,7 @@ def run_sweep(rows, store, on_progress=None, max_workers=MAX_WORKERS):
     return [results[r.line] for r in rows]
 
 
-def _process(fetched, group, store, legacy_counts):
+def _process(fetched, group, store, legacy_counts, since, now):
     first = group[0]
     warning = redirect_warning(first.url, fetched.final_url)
 
@@ -196,24 +237,31 @@ def _process(fetched, group, store, legacy_counts):
                 break
 
     if previous is None:
-        store.put(key, _snapshot(first, items))
+        store.put(key, _snapshot(first, items, {i["id"]: "" for i in items}, now))
         return {r.line: result(r, BASELINE, "First check of this page — saved as the baseline for future "
                                "comparisons.", item_count=len(items)) for r in group}
 
     if legacy_key:
         new_items = legacy_new_items(previous, items, fetched.content, first.url)
+        new_ids = {i["id"] for i in new_items}
         note = f"{len(new_items)} new item(s) (compared with the previous tool version's snapshot)."
-        store.put(key, _snapshot(first, items))
+        store.put(key, _snapshot(first, items, {i["id"]: "" for i in items if i["id"] not in new_ids}, now))
         store.delete(legacy_key)  # migrated to the new per-URL snapshot
     else:
-        new_items = new_items_since(previous, items)
+        first_seen = _first_seen(previous)
+        brand_new = [i for i in items if i["id"] not in first_seen]
+        # ...plus items another person's sweep found after this person's last sweep
+        new_items = [i for i in items if i["id"] not in first_seen or (since and first_seen[i["id"]] > since)]
         note = f"{len(new_items)} new item(s)."
-        if len(new_items) > 0.8 * len(items) and previous.get("items"):
+        if len(new_items) > len(brand_new):
+            note = (f"{len(new_items)} new item(s) ({len(new_items) - len(brand_new)} already found by "
+                    "someone else's sweep since your last one).")
+        if len(brand_new) > 0.8 * len(items) and previous.get("items"):
             note = "Most of the page is different — possibly a redesign or an alternate page. Check manually."
         # Only rewrite the snapshot when the page's items changed, so a sweep where nothing
-        # changed doesn't create a GitHub commit
-        if {i["id"] for i in items} != {i.get("id") for i in previous.get("items", [])}:
-            store.put(key, _snapshot(first, items, previous))
+        # changed doesn't rewrite it
+        if brand_new or {i["id"] for i in items} != {i.get("id") for i in previous.get("items", [])}:
+            store.put(key, _snapshot(first, items, first_seen, now))
 
     if new_items:
         public_items = [public(i) for i in new_items]

@@ -242,12 +242,6 @@ def public(item):
     return {k: v for k, v in item.items() if not k.startswith("_")}
 
 
-def new_items_since(previous, items):
-    """Items never seen before on this page, according to a snapshot saved by this version."""
-    seen = set(previous.get("seen") or []) | {item.get("id") for item in previous.get("items", [])}
-    return [item for item in items if item["id"] not in seen]
-
-
 # --- Compatibility with snapshots saved by the previous version of the tool ---
 # The old version stripped every number from the raw HTML before parsing, kept only the first
 # link of each block, and stored items as a plain list of {title, link, timestamp}. To keep

@@ -15,7 +15,8 @@ st.set_page_config(
 )
 
 from utils.storage import SnapshotStore, clean_project_name, github_configured
-from utils.sweep import read_csv, run_sweep, results_csv, CHANGED, NO_CHANGE, BASELINE, MANUAL, ERROR
+from utils.sweep import (read_csv, run_sweep, results_csv, last_sweep, record_sweep, first_sweep_since, now_iso,
+                         FIRST_SWEEP_DAYS, CHANGED, NO_CHANGE, BASELINE, MANUAL, ERROR)
 
 load_dotenv()
 
@@ -140,8 +141,10 @@ def create_header():
 # Sidebar
 def create_sidebar():
     with st.sidebar:
+        st.write(f"👤 Signed in as **{st.session_state.user_name}**")
         st.markdown("### 📋 Platform Overview")
-        st.write("Monitor competitor websites for changes.")
+        st.write("Monitor competitor websites for changes. Each person sees what is new since "
+                 "**their own** last sweep of a project, even if someone else swept it in between.")
 
         st.markdown("### 📊 Required Data Format")
         st.write("**CSV columns needed:** `Company`, `URL`, `URL Type`")
@@ -149,8 +152,8 @@ def create_sidebar():
                  "**CSV UTF-8** if names contain special characters.")
 
         st.markdown("### 🧭 Result Types")
-        st.write("🆕 **Changed** – new items appeared since the last sweep.")
-        st.write("✅ **No Change** – nothing new since the last sweep.")
+        st.write("🆕 **Changed** – new items appeared since your last sweep.")
+        st.write("✅ **No Change** – nothing new since your last sweep.")
         st.write("📌 **New** – first time this page is checked; saved as the baseline.")
         st.write("👀 **Check manually** – the site blocks automated access or loads its listing with "
                  "JavaScript, so it has to be looked at by a person.")
@@ -171,15 +174,24 @@ if not st.session_state.authenticated:
         st.error("APP_PASSWORD is not configured. Add it to the Streamlit secrets or a .env file.")
         st.stop()
     with st.form("login"):
+        name_input = st.text_input("Your name", help="Used to show you everything that is new since "
+                                   "your own last sweep. Use the same name every time.")
         password_input = st.text_input("Enter Password", type="password")
         submitted = st.form_submit_button("Login")
     if submitted:
-        if hmac.compare_digest(password_input.encode(), PASSWORD.encode()):
+        if not name_input.strip():
+            st.error("Please enter your name.")
+        elif hmac.compare_digest(password_input.encode(), PASSWORD.encode()):
             st.session_state.authenticated = True
+            st.session_state.user_name = " ".join(name_input.split())
             st.rerun()  # Immediately refresh to show upload page
         else:
             st.error("Incorrect password")
     st.stop()
+
+
+def _fmt_time(iso):
+    return datetime.fromisoformat(iso).strftime("%b %d, %Y %H:%M UTC")
 
 
 def _link(url, text=None):
@@ -202,7 +214,8 @@ def show_results(summary):
               for status in (CHANGED, NO_CHANGE, BASELINE, MANUAL, ERROR)}
 
     st.markdown(f"## Summary — {html.escape(summary['project'])}")
-    st.caption(f"Checked {len(results)} rows at {summary['finished']} in {summary['elapsed']:.0f} seconds.")
+    st.caption(f"Checked {len(results)} rows at {summary['finished']} in {summary['elapsed']:.0f} seconds. "
+               f"{summary.get('since_note', '')}")
     cols = st.columns(5)
     cols[0].metric("🆕 Changed", counts[CHANGED])
     cols[1].metric("✅ No Change", counts[NO_CHANGE])
@@ -315,6 +328,17 @@ if uploaded_file:
         if not store.has_history:
             st.info(f"No snapshot history found for “{project_name}” — this sweep will save the baseline.")
 
+        # Report everything first seen since this person's own last sweep of the project
+        user = st.session_state.user_name
+        sweep_time = now_iso()
+        since = last_sweep(store, user)
+        if since:
+            since_note = f"Changes are since your last sweep of this project ({_fmt_time(since)})."
+        else:
+            since = first_sweep_since()
+            since_note = (f"This is your first sweep of this project as “{user}”, so changes from the "
+                          f"last {FIRST_SWEEP_DAYS} days are shown.")
+
         progress_bar = st.progress(0.0)
         status_text = st.empty()
 
@@ -324,17 +348,19 @@ if uploaded_file:
                 status_text.write(f"Checked {done} of {total} rows — last: {row.company} ({row.url_type})")
 
         start = datetime.now()
-        results = run_sweep(rows, store, on_progress)
+        results = run_sweep(rows, store, on_progress, since=since, now=sweep_time)
         progress_bar.empty()
         status_text.write("Saving snapshots…")
 
-        # Snapshots are only saved once the sweep is complete, so an interrupted sweep never
-        # hides changes: they will be detected again on the next run.
+        # Snapshots (and this person's sweep time) are only saved once the sweep is complete,
+        # so an interrupted sweep never hides changes: they will be detected again next run.
+        record_sweep(store, user, sweep_time)
         st.session_state.summary = {
             "project": project_name,
             "results": results,
             "finished": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "elapsed": (datetime.now() - start).total_seconds(),
+            "since_note": since_note,
             "saved": store.save(),
             "store_warnings": store.warnings,
         }
@@ -349,4 +375,5 @@ if st.session_state.authenticated:
     if st.button("Logout"):
         st.session_state.authenticated = False
         st.session_state.pop("summary", None)
+        st.session_state.pop("user_name", None)
         st.rerun()

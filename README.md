@@ -7,12 +7,15 @@ filings…) for new items since the last sweep.
 
 ## Using it
 
-1. Log in and upload a CSV with the columns `Company`, `URL`, `URL Type` (save from Excel as
-   **CSV UTF-8**). Each URL must be the full link to the page (`https://...`).
+1. Log in with your name (use the same name every time) and upload a CSV with the columns
+   `Company`, `URL`, `URL Type` (save from Excel as **CSV UTF-8**). Each URL must be the full
+   link to the page (`https://...`).
 2. Check the project name — snapshot history is kept per project, so use the same name every
    time for the same sweep — and click **Run sweep**.
 3. Each row is reported as:
-   - **Changed** – new items appeared since the last sweep (expand the row to see them)
+   - **Changed** – new items appeared since *your* last sweep of this project, including items
+     a colleague's sweep found in the meantime (expand the row to see them). On your first
+     sweep of a project, items first seen in the last 7 days are shown.
    - **No Change** – nothing new
    - **New (baseline saved)** – first time this page is checked
    - **Check manually** – the site blocks automated access or loads its listing with
